@@ -9,6 +9,7 @@ Default sources (no trading permission required):
   GET /sapi/v1/capital/deposit/hisrec
   GET /sapi/v1/capital/withdraw/history
   GET /sapi/v1/asset/transfer
+  GET /sapi/v1/c2c/orderMatch/listUserOrderHistory
 
 Optional (need BINANCE_SYMBOLS):
   GET /api/v3/myTrades
@@ -35,7 +36,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlencode
 
 import requests
@@ -47,8 +48,21 @@ SEEN_ID_LIMIT = 4000
 OVERLAP_SECONDS = 2
 DEFAULT_PAGE_LIMIT = 1000
 TRANSFER_PAGE_SIZE = 100
+DAY_MS = 24 * 60 * 60 * 1000
 
-DEFAULT_SOURCES = ["deposit", "withdraw", "transfer"]
+# Binance startTime/endTime spans must stay strictly below these documented maxima.
+SOURCE_MAX_WINDOW_MS = {
+    "deposit": 90 * DAY_MS - 1000,
+    "withdraw": 90 * DAY_MS - 1000,
+    "transfer": 7 * DAY_MS - 1000,
+    "c2c": 30 * DAY_MS - 1000,
+    "trade": DAY_MS - 1000,
+    "order": DAY_MS - 1000,
+}
+
+C2C_PAGE_SIZE = 100
+
+DEFAULT_SOURCES = ["deposit", "withdraw", "transfer", "c2c"]
 OPTIONAL_SOURCES = {"trade", "order"}
 KNOWN_SOURCES = set(DEFAULT_SOURCES) | OPTIONAL_SOURCES
 
@@ -88,6 +102,18 @@ ORDER_STATUS_SEVERITY = {
     "REJECTED": 5,
     "EXPIRED": 4,
     "EXPIRED_IN_MATCH": 4,
+}
+C2C_STATUS_SEVERITY = {
+    "PENDING": 4,
+    "TRADING": 4,
+    "BUYER_PAYED": 4,
+    "BUYER_PAID": 4,
+    "DISTRIBUTING": 4,
+    "COMPLETED": 3,
+    "IN_APPEAL": 5,
+    "CANCELLED": 4,
+    "CANCELED": 4,
+    "CANCELLED_BY_SYSTEM": 4,
 }
 
 
@@ -168,6 +194,8 @@ def event_id_for(source: str, event: Dict[str, Any]) -> str:
         return str(event.get("id") or event.get("withdrawOrderId") or event.get("txId") or "")
     if source == "transfer":
         return str(event.get("tranId") or event.get("id") or "")
+    if source == "c2c":
+        return str(event.get("orderNumber") or event.get("orderNo") or event.get("id") or "")
     if source == "trade":
         symbol = event.get("symbol") or ""
         trade_id = event.get("id")
@@ -205,6 +233,9 @@ def map_severity(source: str, event: Dict[str, Any]) -> int:
     if kind == "order":
         status = str(event.get("status") or "").upper()
         return ORDER_STATUS_SEVERITY.get(status, 3)
+    if kind == "c2c":
+        status = str(event.get("orderStatus") or event.get("status") or "").upper()
+        return C2C_STATUS_SEVERITY.get(status, 3)
     return 3
 
 
@@ -503,6 +534,61 @@ class BinanceClient:
             )
         return events
 
+    def fetch_c2c_orders(self, start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            payload = self._request(
+                "GET",
+                "/sapi/v1/c2c/orderMatch/listUserOrderHistory",
+                params={
+                    "startTimestamp": start_ms,
+                    "endTimestamp": end_ms,
+                    "page": page,
+                    "rows": C2C_PAGE_SIZE,
+                },
+            )
+            rows = self._c2c_rows(payload)
+            events.extend(rows)
+            total = self._c2c_total(payload)
+            if not rows or len(rows) < C2C_PAGE_SIZE:
+                break
+            if total and page * C2C_PAGE_SIZE >= total:
+                break
+            page += 1
+        return events
+
+    @staticmethod
+    def _c2c_rows(payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        if not isinstance(payload, dict):
+            return []
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+        if isinstance(data, dict):
+            rows = data.get("data") or data.get("list") or data.get("rows") or []
+            return [row for row in rows if isinstance(row, dict)]
+        return []
+
+    @staticmethod
+    def _c2c_total(payload: Any) -> int:
+        if not isinstance(payload, dict):
+            return 0
+        if payload.get("total") is not None:
+            try:
+                return int(payload["total"])
+            except (TypeError, ValueError):
+                return 0
+        data = payload.get("data")
+        if isinstance(data, dict) and data.get("total") is not None:
+            try:
+                return int(data["total"])
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
 
 class CoralogixShipper:
     def __init__(
@@ -592,6 +678,18 @@ def window_start_ms(state: StateStore, key: str, lookback_minutes: int) -> int:
     return max(0, window_start - overlap_ms)
 
 
+def iter_time_windows(start_ms: int, end_ms: int, max_span_ms: int) -> List[tuple[int, int]]:
+    if start_ms >= end_ms or max_span_ms <= 0:
+        return []
+    windows: List[tuple[int, int]] = []
+    cursor = start_ms
+    while cursor < end_ms:
+        chunk_end = min(cursor + max_span_ms, end_ms)
+        windows.append((cursor, chunk_end))
+        cursor = chunk_end
+    return windows
+
+
 def filter_new_events(
     source: str,
     events: List[Dict[str, Any]],
@@ -623,11 +721,8 @@ def ship_source(
     state_key: str,
     *,
     dry_run: bool,
+    window_end_ms: Optional[int] = None,
 ) -> int:
-    if not events:
-        LOGGER.info("%s: no new events", state_key)
-        return 0
-
     new_ids: List[str] = []
     last_ts = state.get_last_time_ms(state_key)
     for event in events:
@@ -637,6 +732,15 @@ def ship_source(
         event_ts = event_timestamp_ms(event)
         if event_ts is not None:
             last_ts = event_ts if last_ts is None else max(last_ts, event_ts)
+    if window_end_ms is not None:
+        last_ts = window_end_ms if last_ts is None else max(last_ts, window_end_ms)
+
+    if not events:
+        LOGGER.info("%s: no new events", state_key)
+        if not dry_run and last_ts is not None:
+            state.update(state_key, [], last_ts)
+            state.save()
+        return 0
 
     if dry_run:
         LOGGER.info("Dry run: would ship %s %s events", len(events), state_key)
@@ -649,6 +753,51 @@ def ship_source(
     state.save()
     LOGGER.info("%s: shipped %s events", state_key, sent)
     return sent
+
+
+def poll_source_windows(
+    source: str,
+    state_key: str,
+    fetch_fn: Callable[[int, int], List[Dict[str, Any]]],
+    shipper: CoralogixShipper,
+    state: StateStore,
+    *,
+    lookback_minutes: int,
+    now_ms: int,
+    dry_run: bool,
+    extra: Optional[Dict[str, Any]] = None,
+    log_label: Optional[str] = None,
+) -> int:
+    label = log_label or state_key
+    start_ms = window_start_ms(state, state_key, lookback_minutes)
+    total = 0
+    for chunk_start, chunk_end in iter_time_windows(
+        start_ms, now_ms, SOURCE_MAX_WINDOW_MS[source]
+    ):
+        try:
+            raw = fetch_fn(chunk_start, chunk_end)
+        except RuntimeError as exc:
+            LOGGER.error("%s failed: %s", label, exc)
+            break
+        events = filter_new_events(source, raw, state.get_seen_ids(state_key), extra=extra)
+        LOGGER.info(
+            "%s scan: scanned=%s kept=%s window=%s .. %s",
+            label,
+            len(raw),
+            len(events),
+            ms_to_iso(chunk_start),
+            ms_to_iso(chunk_end),
+        )
+        total += ship_source(
+            source,
+            events,
+            shipper,
+            state,
+            state_key,
+            dry_run=dry_run,
+            window_end_ms=chunk_end,
+        )
+    return total
 
 
 def poll_sources(
@@ -666,89 +815,91 @@ def poll_sources(
     total = 0
 
     if "deposit" in sources:
-        key = "deposit"
-        start_ms = window_start_ms(state, key, lookback_minutes)
-        raw = binance.fetch_deposits(start_ms, now_ms)
-        events = filter_new_events("deposit", raw, state.get_seen_ids(key))
-        LOGGER.info(
-            "Deposit scan: scanned=%s kept=%s window=%s .. %s",
-            len(raw),
-            len(events),
-            ms_to_iso(start_ms),
-            ms_to_iso(now_ms),
+        total += poll_source_windows(
+            "deposit",
+            "deposit",
+            binance.fetch_deposits,
+            shipper,
+            state,
+            lookback_minutes=lookback_minutes,
+            now_ms=now_ms,
+            dry_run=dry_run,
+            log_label="Deposit",
         )
-        total += ship_source("deposit", events, shipper, state, key, dry_run=dry_run)
 
     if "withdraw" in sources:
-        key = "withdraw"
-        start_ms = window_start_ms(state, key, lookback_minutes)
-        raw = binance.fetch_withdrawals(start_ms, now_ms)
-        events = filter_new_events("withdraw", raw, state.get_seen_ids(key))
-        LOGGER.info(
-            "Withdraw scan: scanned=%s kept=%s window=%s .. %s",
-            len(raw),
-            len(events),
-            ms_to_iso(start_ms),
-            ms_to_iso(now_ms),
+        total += poll_source_windows(
+            "withdraw",
+            "withdraw",
+            binance.fetch_withdrawals,
+            shipper,
+            state,
+            lookback_minutes=lookback_minutes,
+            now_ms=now_ms,
+            dry_run=dry_run,
+            log_label="Withdraw",
         )
-        total += ship_source("withdraw", events, shipper, state, key, dry_run=dry_run)
 
     if "transfer" in sources:
         for transfer_type in transfer_types:
-            key = f"transfer:{transfer_type}"
-            start_ms = window_start_ms(state, key, lookback_minutes)
-            try:
-                raw = binance.fetch_transfers(transfer_type, start_ms, now_ms)
-            except RuntimeError as exc:
-                LOGGER.error("Transfer type %s failed: %s", transfer_type, exc)
-                continue
-            events = filter_new_events(
+            total += poll_source_windows(
                 "transfer",
-                raw,
-                state.get_seen_ids(key),
+                f"transfer:{transfer_type}",
+                lambda start, end, transfer_type=transfer_type: binance.fetch_transfers(
+                    transfer_type, start, end
+                ),
+                shipper,
+                state,
+                lookback_minutes=lookback_minutes,
+                now_ms=now_ms,
+                dry_run=dry_run,
                 extra={"transferType": transfer_type},
+                log_label=f"Transfer {transfer_type}",
             )
-            LOGGER.info(
-                "Transfer %s scan: scanned=%s kept=%s window=%s .. %s",
-                transfer_type,
-                len(raw),
-                len(events),
-                ms_to_iso(start_ms),
-                ms_to_iso(now_ms),
+
+    if "c2c" in sources:
+        try:
+            total += poll_source_windows(
+                "c2c",
+                "c2c",
+                binance.fetch_c2c_orders,
+                shipper,
+                state,
+                lookback_minutes=lookback_minutes,
+                now_ms=now_ms,
+                dry_run=dry_run,
+                log_label="C2C",
             )
-            total += ship_source("transfer", events, shipper, state, key, dry_run=dry_run)
+        except Exception as exc:
+            LOGGER.error("C2C failed: %s", exc)
 
     if "trade" in sources:
         for symbol in symbols:
-            key = f"trade:{symbol}"
-            start_ms = window_start_ms(state, key, lookback_minutes)
-            raw = binance.fetch_trades(symbol, start_ms, now_ms)
-            events = filter_new_events("trade", raw, state.get_seen_ids(key))
-            LOGGER.info(
-                "Trade %s scan: scanned=%s kept=%s window=%s .. %s",
-                symbol,
-                len(raw),
-                len(events),
-                ms_to_iso(start_ms),
-                ms_to_iso(now_ms),
+            total += poll_source_windows(
+                "trade",
+                f"trade:{symbol}",
+                lambda start, end, symbol=symbol: binance.fetch_trades(symbol, start, end),
+                shipper,
+                state,
+                lookback_minutes=lookback_minutes,
+                now_ms=now_ms,
+                dry_run=dry_run,
+                log_label=f"Trade {symbol}",
             )
-            total += ship_source("trade", events, shipper, state, key, dry_run=dry_run)
 
     if "order" in sources:
         for symbol in symbols:
-            key = f"order:{symbol}"
-            start_ms = window_start_ms(state, key, lookback_minutes)
-            raw = binance.fetch_orders(symbol, start_ms, now_ms)
-            events = filter_new_events("order", raw, state.get_seen_ids(key))
-            LOGGER.info(
-                "Order %s scan: scanned=%s kept=%s window=%s .. %s",
-                symbol,
-                len(raw),
-                len(events),
-                ms_to_iso(start_ms),
-                ms_to_iso(now_ms),
+            total += poll_source_windows(
+                "order",
+                f"order:{symbol}",
+                lambda start, end, symbol=symbol: binance.fetch_orders(symbol, start, end),
+                shipper,
+                state,
+                lookback_minutes=lookback_minutes,
+                now_ms=now_ms,
+                dry_run=dry_run,
+                log_label=f"Order {symbol}",
             )
-            total += ship_source("order", events, shipper, state, key, dry_run=dry_run)
 
     return total
 

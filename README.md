@@ -15,14 +15,15 @@ Each cron run is a single shot (`--once --lookback-minutes 5`). The process exit
 
 ```
 Binance USER_DATA APIs                    Coralogix Logs API
-GET /sapi/v1/capital/deposit/hisrec  ┐
-GET /sapi/v1/capital/withdraw/history┤ →  poller  →  POST /logs/v1/singles
-GET /sapi/v1/asset/transfer          ┘                   application: binance
-GET /api/v3/myTrades  (optional)                         subsystem: exchange-logs
+GET /sapi/v1/capital/deposit/hisrec              ┐
+GET /sapi/v1/capital/withdraw/history            ┤
+GET /sapi/v1/asset/transfer                      ┤ →  poller  →  POST /logs/v1/singles
+GET /sapi/v1/c2c/orderMatch/listUserOrderHistory ┘                   application: binance
+GET /api/v3/myTrades  (optional)                                     subsystem: exchange-logs
 GET /api/v3/allOrders (optional)
 ```
 
-Binance does not expose a single account-audit endpoint. This integration polls the official history APIs for deposits, withdrawals, wallet transfers, and optionally spot trades/orders.
+Binance does not expose a single account-audit endpoint. This integration polls the official history APIs for deposits, withdrawals, wallet transfers, C2C/P2P orders, and optionally spot trades/orders.
 
 ## How the 5-minute poll works
 
@@ -39,12 +40,12 @@ Binance does not expose a single account-audit endpoint. This integration polls 
 Each run:
 
 1. Syncs the host clock with `GET /api/v3/time`
-2. Reads deposit, withdraw, and transfer history for the last 5 minutes
+2. Reads deposit, withdraw, transfer, and C2C history for the last 5 minutes
 3. Drops events already recorded in `state.json`
 4. POSTs new events to Coralogix Logs (`/logs/v1/singles`)
-5. Updates `state.json` with shipped IDs and the latest timestamp
+5. Updates `state.json` with shipped IDs and the latest scanned timestamp (including empty or fully-deduped scans)
 
-If a cron tick is missed (host asleep, job delayed), the next run catches up from the last checkpoint instead of dropping events. A 2-second overlap on the window covers clock skew between ticks.
+If a cron tick is missed (host asleep, job delayed), the next run catches up from the last checkpoint instead of dropping events. Long gaps are fetched in endpoint-legal chunks (90 days for deposit/withdraw, 7 days for transfers, 24 hours for trades/orders). A 2-second overlap on the window covers clock skew between ticks.
 
 ## APIs used
 
@@ -53,6 +54,7 @@ If a cron tick is missed (host asleep, job delayed), the next run catches up fro
 | Pull | Binance `GET /sapi/v1/capital/deposit/hisrec` | HMAC-SHA256 (`X-MBX-APIKEY` + `signature`) |
 | Pull | Binance `GET /sapi/v1/capital/withdraw/history` | HMAC-SHA256 |
 | Pull | Binance `GET /sapi/v1/asset/transfer` | HMAC-SHA256 |
+| Pull | Binance `GET /sapi/v1/c2c/orderMatch/listUserOrderHistory` | HMAC-SHA256 |
 | Pull | Binance `GET /api/v3/myTrades` (optional) | HMAC-SHA256, requires `BINANCE_SYMBOLS` |
 | Pull | Binance `GET /api/v3/allOrders` (optional) | HMAC-SHA256, requires `BINANCE_SYMBOLS` |
 | Push | Coralogix `POST https://ingress.<domain>/logs/v1/singles` | Send-Your-Data API key (Bearer) |
@@ -87,7 +89,7 @@ Edit `.env` and put real keys there (never commit `.env`):
 BINANCE_API_KEY=...
 BINANCE_API_SECRET=...
 BINANCE_BASE_URL=https://api.binance.com
-BINANCE_SOURCES=deposit,withdraw,transfer
+BINANCE_SOURCES=deposit,withdraw,transfer,c2c
 
 CORALOGIX_SEND_YOUR_DATA_KEY=...
 CORALOGIX_DOMAIN=eu1.coralogix.com
@@ -134,7 +136,7 @@ This sleeps `POLL_INTERVAL_SECONDS` (default `300`) between cycles. Prefer **cro
 Spot trade and order history require a symbol on every Binance request:
 
 ```bash
-BINANCE_SOURCES=deposit,withdraw,transfer,trade,order
+BINANCE_SOURCES=deposit,withdraw,transfer,c2c,trade,order
 BINANCE_SYMBOLS=BTCUSDT,ETHUSDT
 ```
 
@@ -289,10 +291,11 @@ In **Explore** / **Logs**:
 
 Useful fields inside `text`:
 
-- `event_source`: `binance_deposit`, `binance_withdraw`, `binance_transfer`, `binance_trade`, `binance_order`
+- `event_source`: `binance_deposit`, `binance_withdraw`, `binance_transfer`, `binance_c2c`, `binance_trade`, `binance_order`
 - `cx_category`: `binance-deposit`, `binance-withdraw`, …
 - Deposit / withdraw: `coin`, `amount`, `network`, `address`, `txId`, `status`
 - Transfer: `asset`, `amount`, `tranId`, `transferType`
+- C2C: `orderNumber`, `tradeType`, `asset`, `fiat`, `amount`, `orderStatus`
 - Trade / order: `symbol`, `side`, `price`, `qty`, `status`
 
 ## CLI
@@ -324,6 +327,7 @@ Cron and `run.sh` always use `--once --lookback-minutes 5`.
 | `-1021 Timestamp outside recvWindow` | Host clock drift. Enable NTP, or raise `BINANCE_RECV_WINDOW` (max 60000). |
 | `-1002 You are not authorized` | API key cannot read USER_DATA. Enable Reading. |
 | Transfer type failed | That wallet product is not enabled on the account. Remove it from `BINANCE_TRANSFER_TYPES`. |
+| C2C returned empty or unauthorized | No P2P activity in the window, or the key cannot read C2C history. Remove `c2c` from `BINANCE_SOURCES` if unused. |
 | No logs in Coralogix | Wrong `CORALOGIX_DOMAIN`, or Explore time range misses event timestamps. Empty Binance history also ships `0` events. |
 | `Missing required environment variable` | `.env` missing in the cron working directory. |
 | Cron runs with no output | Check absolute paths, venv Python, and log file permissions. |
